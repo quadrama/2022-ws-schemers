@@ -1,0 +1,505 @@
+---
+title: "QuaDramA Workshop 2022"
+output:
+  pdf_document:
+    pandoc_args: [
+      "--pdf-engine","pdflatex", "--filter", "pandoc-crossref", "-M", "figPrefix=Abbildung", "-M", "tblPrefix=Tabelle"
+      ]
+    keep_tex: true
+lang: en
+documentclass: article
+---
+
+# Init
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache=TRUE, message = FALSE, warning = FALSE)
+options(knitr.kable.NA = '-', knitr.table.format = "latex")
+
+library(DramaAnalysis)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggbiplot)
+library(ggdendro)
+library(corrplot)
+library(kableExtra)
+library(caret)
+library(gbm)
+library(rpart)
+library(MLmetrics)
+library(e1071)
+library(randomForest)
+library(nnet)
+library(tools)
+library(DMwR) # SMOTE
+library(iml) # Interpretable Machine Learning
+library(ranger)
+library(cluster) # kmedoids clustering
+library(irr) # Interrater Reliability
+library(rattle) # Plot decision trees
+library(tidyverse)
+library(gridExtra)
+library(grid)
+library(ggridges)
+library(ggthemes)
+library(ggrepel)
+theme_set(theme_minimal())
+library(doParallel)
+cl <- makePSOCKcluster(3)
+registerDoParallel(cl)
+
+fig_dir <- "../data/figs/"
+
+source("R/functions.R")
+#########################
+
+# Get all the annotations
+if (file.exists("../data/f_schemer_new.RData")) {
+  load("../data/f_schemer_new.RData")
+} else {
+  stop("../data/f_schemer_new.RData does not exist")
+}
+
+##########
+##########
+# Init ML
+classes <- c("Schemer", "Non-Schemer")
+current_type <- classes[1]
+generic_other_type <- paste0("Non-", current_type)
+other_type <- classes[2]
+#other_type <- generic_other_type
+if (length(classes>2)) {
+  third_type <- classes[3]
+}
+classifyWithPCASchemers <- FALSE # Only enable this option if the PCA analysis has been run
+# Features
+featuresAppear <- c("firstBegin", "lastEnd")
+featuresDegree <- c("degree", "wdegree", "close", "eigen", "between")
+featuresPresence <- c("actives", "passives")
+featuresTopicModel <- paste0("T",1:20)
+featuresSentiment <- c("posRatio", "negRatio")
+featuresUtt <- c("utterances", "utteranceLengthMean", "utteranceLengthSd")
+featuresWF <- c("Liebe", "Familie", "Krieg", "Ratio", "Religion", "Wirtschaft", "Politik")
+featuresDramaMeta <- c("prose", "Decade")
+featuresVerbs <- c(names(f[,startsWith(names(f), "utt.")]), names(f[,startsWith(names(f), "sd.")]))
+
+featuresAction <- featuresVerbs
+featuresStagePresence <- c(featuresPresence, "tokens", "utterances", featuresAppear)
+featuresInteraction <- featuresDegree
+featuresTopics <- c(featuresTopicModel, featuresWF)
+featuresGenreEpoche <- featuresDramaMeta
+featuresCharacterStyle <- c("TTR", "utteranceLengthMean", "utteranceLengthSd")
+all_features <- c(featuresAction, featuresStagePresence, featuresInteraction,
+                  featuresTopics, featuresGenreEpoche, featuresCharacterStyle)
+
+seed <- 42
+set.seed(seed)
+
+if (file.exists("../data/results.RData")) {
+  load("../data/results.RData")
+}
+
+fraw <- f
+if (classifyWithPCASchemers == TRUE) {
+  coregroup.ids <- v.pca$x %>% as.data.frame() %>% filter(1.25 < PC1 & PC1 < 3.75 & -3.5 < PC2 & PC2 < 3.5) %>% rownames()
+  coregroup <- f_spread[coregroup.ids, ] %>% filter(type == "Schemer") %>% select(drama, character)
+  fraw <- rbind(fraw %>% filter(type == "Non-Schemer"), merge(fraw, coregroup))
+}
+```
+
+# Corpus preparation
+
+```{r prepare, include=F}
+
+prepareData <- function(f, current_type, other_type) {
+  f[is.na(f)] <- 0
+  f <- na.omit(f)
+  
+  if (other_type == generic_other_type) {
+    too_close <- c()
+    if (current_type == "Intrigant:in") {
+      too_close <- c("Intrigant", "Intrigantin", "Stratege", "Gegenspieler",
+                     "Gegenspielerin", "Tyrann", "Tyrannin")
+    }
+    if (length(too_close) != 0) {
+      current_type_chars_index <- which(f$type == current_type)
+      current_type_chars_index.drama <- f[current_type_chars_index,]$drama
+      current_type_chars_index.char <- f[current_type_chars_index,]$character
+      too_close_index <- which(f$type %in% too_close)
+      too_close_index.drama <- f[too_close_index,]$drama
+      too_close_index.char <- f[too_close_index,]$character
+      keep <- which(paste0(too_close_index.drama, too_close_index.char)
+                    %in% paste0(current_type_chars_index.drama, current_type_chars_index.char))
+      too_close_index.drama <- too_close_index.drama[-keep]
+      too_close_index.char <- too_close_index.char[-keep]
+      f <- f[!paste0(f$drama, f$character) %in% 
+               paste0(too_close_index.drama, too_close_index.char),]
+    }
+    current_type_chars <- f[which(f$type == current_type), ]
+    f$type <- other_type
+    f[rownames(current_type_chars),]$type <- current_type
+    f <- unique(f)
+  } else {
+    f <- unique(f[which(f$type == current_type | f$type == other_type), ])
+  }
+  f$type <- factor(f$type)
+  f <- unique(f)
+  f <- f %>% group_by(corpus, drama, character) %>% filter(if (n() > 1) {type == current_type} else {type == type})
+  
+  f$actives <- f$actives/f$scenes
+  f$passives <- f$passives/f$scenes
+  f$tokens <- f$tokens/f$length
+  f$presence <- NULL
+  f$firstBegin <- f$firstBegin/f$length
+  f$lastEnd <- f$lastEnd/f$length
+  orig <- f
+  f$corpus <- NULL
+  f$drama <- NULL
+  f$character <- NULL
+  f$length <- NULL
+  f$scenes <- NULL
+  f$Speaker.figure_surface <- NULL
+  f$documentTitle <- NULL
+  f$language <- NULL
+  f$Name <- NULL
+  f$Translator.Name <- NULL
+  f$Pnd <- NULL
+  f$Translator.Pnd <- NULL
+  f$lastAct <- as.integer(f$lastAct)
+  
+  list(f=f,orig=orig)
+}
+
+f <- prepareData(fraw, current_type, other_type)
+f$orig$Speaker.figure_surface <- toTitleCase(tolower(as.character(f$orig$Speaker.figure_surface)))
+
+write.csv(f$f, file="features.csv")
+```
+
+# Klassifikation
+
+```{r ml}
+
+trainML <- function(features, data, orig, classes, seed) {
+  
+  set.seed(seed)
+  x_orig <- data[c(features)]
+  y_orig <- data$type
+  data <- data[c(features, "type")]
+  train_index <- createDataPartition(data$type, p=0.80, list=FALSE)
+  train_indices <- createMultiFolds(data$type, k=10, times = 1)
+  train <- data[train_index,]
+  train_folds_orig <- lapply(train_indices, function(x) {orig[x,]})
+  train_folds <- lapply(train_indices, function(x) {data[x,]})
+  test <- data[-train_index,]
+  test_folds_orig <- lapply(train_indices, function(x) {orig[-x,]})
+  test_folds <- lapply(train_indices, function(x) {data[-x,]})
+  
+  # Remove highly correlated variables
+  if (length(features)>1) {
+    train <- train[,apply(train,2,function(train) !all(train==0))]
+    train <- train[vapply(train, function(x) length(unique(x)) > 1, logical(1L))] # Remove features that have just one value
+    if (length(train) > 2) {
+      train.cor <- cor(subset(train, select=-c(type)))
+      hc <- findCorrelation(train.cor, cutoff=0.7)
+      hc <- sort(hc)
+      if (length(hc)!=0) {
+        train <- train[,-c(hc)]
+      } else {
+        # No correlating variables found
+      }
+    }
+  } else {
+    # Just one feature
+  }
+  
+  # Remove highly correlated variables
+  train_folds <- lapply(train_folds, function(curr_train, feature_arg = features) {
+    feature_arg <- features
+    curr_train <- train_folds$Fold01.Rep1
+    if (length(feature_arg)>1) {
+      train <- curr_train[,apply(curr_train,2,function(train) !all(train==0))]
+      train <- train[vapply(train, function(x) length(unique(x)) > 1, logical(1L))] # Remove features that have just one value
+      if (length(train) > 2) {
+        train.cor <- cor(subset(train, select=-c(type)))
+        hc <- findCorrelation(train.cor, cutoff=0.7)
+        hc <- sort(hc)
+        if (length(hc)!=0) {
+          train <- train[,-c(hc)]
+        } else {
+          # No correlating variables found
+        }
+      }
+    } else {
+      # Just one feature
+    }
+    train
+  })
+  
+  train_sampled <- SMOTE(type ~ ., as.data.frame(train), perc.over = 600, perc.under=100, k = 5)
+  train_folds_sampled <- lapply(train_folds, function(train) {SMOTE(type ~ ., as.data.frame(train), perc.over = 600, perc.under=100, k = 5)})
+  model <- tune.randomForest(type~., data = train_sampled, tunecontrol = tune.control(cross = 10, nrepeat = 10, sampling = "cross"))
+  models <- lapply(train_folds_sampled, function(train_sampled) {tune.randomForest(type~., data = train_sampled, tunecontrol = tune.control(cross = 10, nrepeat = 10, sampling = "cross"))})
+  best_model <- model$best.model
+  best_models <- lapply(models, function(model) {model$best.model})
+  
+  cm <- confusionMatrix(reference = test$type, data = predict(best_model, test, type = "class"), mode = "everything", positive = "Schemer")
+  cm_folds <- lapply(1:length(best_models), function(x) {confusionMatrix(reference = test_folds[[x]]$type, data = predict(best_models[[x]], test_folds[[x]], type = "class"), mode = "everything", positive = "Schemer")})
+  
+  best_fold_index <- Reduce(rbind, lapply(cm_folds, function(x) {x$byClass}))
+  best_fold_index <- as.data.frame(best_fold_index[rownames(best_fold_index) == paste0("Class: ", classes[1]),])
+  best_fold_index <- which(best_fold_index$F1 == max(best_fold_index$F1, na.rm = TRUE))[1]
+  cm_folds_avg <- cm_folds[[1]]
+  cm_folds_avg$overall <- Reduce(rbind, lapply(cm_folds, function(x) {x$overall}))
+  cm_folds_avg$overall <- colMeans(cm_folds_avg$overall, na.rm = TRUE)
+  cm_folds_avg$byClass <- Reduce(rbind, lapply(cm_folds, function(x) {x$byClass}))
+  cm_folds_avg$byClass <- colMeans(cm_folds_avg$byClass, na.rm = TRUE)
+  
+  train$corpus <- orig[train_index,]$corpus
+  train$drama <- orig[train_index,]$drama
+  train$character <- orig[train_index,]$character
+  test$corpus <- orig[-train_index,]$corpus
+  test$drama <- orig[-train_index,]$drama
+  test$character <- orig[-train_index,]$character
+  
+  predictionsBest <- predict(best_model, x_orig, type = "class")
+  predictionsTest <- predict(best_model, test, type = "class")
+  predictionsTestFolds <- lapply(1:length(best_models), function(x) {predict(best_models[[x]], test_folds[[x]], type = "class")})
+  predBest <- data.frame(orig[,c("corpus","drama","character")], pred=predictionsBest, ref=orig[,"type"])
+  predTest <- data.frame(test[,c("corpus","drama","character")], pred=predictionsTest, ref=test[,"type"])
+  predTestFolds <- lapply(1:length(predictionsTestFolds), function(x) {data.frame(test_folds_orig[[x]][,c("corpus","drama","character")], pred=predictionsTestFolds[[x]], ref=test_folds_orig[[x]][,"type"])})
+  predTestFolds <- Reduce(rbind, predTestFolds)
+  falsePredictionsBest <- predBest[predBest$pred != predBest$type,]
+  falsePredictionsTest <- predTest[predTest$pred != predTest$type,]
+  falsePredictionsTestFolds <- predTestFolds[predTestFolds$pred != predTestFolds$type,]
+  correctPredictionsBest <- predBest[predBest$pred == predBest$type,]
+  correctPredictionsTest <- predTest[predTest$pred == predTest$type,]
+  correctPredictionsTestFolds <- predTestFolds[predTestFolds$pred == predTestFolds$type,]
+  list(x=x_orig, y=y_orig, cmBest=cm, cm=cm_folds_avg, model=models, bestmodel=best_models[[best_fold_index]], predBest=predBest, correctBest=correctPredictionsBest, mistakesBest=falsePredictionsBest, train=train_folds, test=test_folds, predTest=predTestFolds, correctTest=correctPredictionsTestFolds, mistakesTest=falsePredictionsTestFolds)
+}
+
+results <- list()
+results$Action <- trainML(featuresAction, f$f, f$orig, classes, seed)
+results$StagePresence <- trainML(featuresStagePresence, f$f, f$orig, classes, seed)
+results$Interaction <- trainML(featuresInteraction, f$f, f$orig, classes, seed)
+results$Topics <- trainML(featuresTopics, f$f, f$orig, classes, seed)
+results$GenreEpoche <- trainML(featuresGenreEpoche, f$f, f$orig, classes, seed)
+results$CharacterStyle <- trainML(featuresCharacterStyle, f$f, f$orig, classes, seed)
+results$Sentiment <- trainML(featuresSentiment, f$f, f$orig, classes, seed)
+results$All <- trainML(all_features, f$f, f$orig, classes, seed)
+
+dfOverall <- data.frame(t(data.frame(lapply(results, function(x) {x$cm$overall}))))
+knitr::kable(dfOverall[,c("Accuracy", "AccuracyPValue", "McnemarPValue")], 
+             format="pandoc", digits = 10,
+             col.names = c("Accuracy", "P-Value (Acc > Maj)", "Mcnemar's Test P-Value"),
+             caption="P-Values.\n{#tbl:resultsPvalues}")
+
+df <- data.frame(t(data.frame(lapply(results, function(x) {x$cm$byClass}))))
+df <- setDT(df, keep.rownames = TRUE)[]
+df <- dplyr::rename(df, model = rn)
+df <- df %>% pivot_longer(cols = colnames(df)[2:length(colnames(df))], names_to = "measure", values_to = "value")
+df <- data.table(df)
+df <- df[measure %in% c("Precision", "Recall", "F1")]
+df$measure <- factor(df$measure, levels = c("F1", "Precision", "Recall"))
+df$model <- factor(df$model, levels = unique(c("All", sort(as.vector(df$model)[-which(as.vector(df$model) == "All")]))))
+ggResults <- df %>%
+  ggplot(aes(x = measure, y = value, fill = measure)) +
+  geom_bar(position = "dodge", stat = "identity") +
+  geom_text(aes(label=sprintf(round(value, digits = 2), fmt = "%#.2f")), vjust=ifelse(df$value>=0.9, 1.6, -0.3), color="black", size=2.5)+
+  scale_fill_grey() + 
+  xlab("") + ylab("") +
+  labs(color="Metrik") + 
+  facet_wrap(~ model, ncol = 2) +
+  theme(axis.text.x = element_blank(), 
+        legend.title = element_blank(),
+        plot.margin=grid::unit(c(2,2,2,2), "mm")) +
+  ylim(0, 1)
+
+ggResults
+if (classifyWithPCASchemers == TRUE) {
+  ggsave(filename = paste0(fig_dir,"results-", paste(classes, collapse="-"), "_pcacoregroup", ".png"), plot = ggResults, dpi = 300)#, width = 7, height = 3.5)
+write.table(x = df, file = paste0(fig_dir,"results-", paste(classes, collapse="-"), "_pcacoregroup", ".csv"), sep = ",", col.names = TRUE, row.names = FALSE)
+} else {
+  ggsave(filename = paste0(fig_dir,"results-", paste(classes, collapse="-"), ".png"), plot = ggResults, dpi = 300)#, width = 7, height = 3.5)
+  write.table(x = df, file = paste0(fig_dir,"results-", paste(classes, collapse="-"), ".csv"), sep = ",", col.names = TRUE, row.names = FALSE)
+}
+```
+
+```{r correctH}
+
+correct<-merge(results$All$correctTest, f$orig)
+correct<-correct[row.names(unique(correct[,c("drama","character")])),]
+correct<-merge(correct,results$All$predTest)
+correct$TP <- ifelse(correct$type == "Schemer" & correct$pred == "Schemer", TRUE, FALSE)
+if (nrow(correct) > 0) {
+  print<-correct[,c("corpus","drama","Speaker.figure_surface","type")]
+  
+  knitr::kable(print, 
+               digits=2, format="pandoc",
+               col.names = c("Corpus","Drama","Character","Class"),
+               caption="TP.\n{#tbl:resultsCorrectH}", row.names = F)
+}
+```
+
+```{r incorrectH}
+
+incorrect<-merge(results$All$mistakesTest, f$orig)
+incorrect<-incorrect[row.names(unique(incorrect[,c("drama","character")])),]
+incorrect<-merge(incorrect,results$All$predTest)
+incorrect$FP <- ifelse(incorrect$type == "Non-Schemer" & incorrect$pred == "Schemer", TRUE, FALSE)
+if (nrow(incorrect) > 0) {
+  print<-incorrect[,c("corpus","drama","Speaker.figure_surface","pred","type")]
+
+  knitr::kable(print, 
+             digits=2, format="pandoc",
+             col.names = c("Corpus","Drama","Character","Predicted","Actual"),
+             caption="Classification errors.\n{#tbl:resultsInCorrectH}", row.names = F)
+}
+```
+
+# Feature Analysis
+
+## Feature Distribution for TP, TN, FP, FN
+
+```{r featuredistribution-tp-tn-fp-fn, fig.cap="Featureverteilung", results="asis", fig.width=15,fig.height=15}
+featuresDist <- c("tokens", "utterances", "Religion")
+
+f$eval <- f$orig
+f$eval <- merge(f$eval, correct[, c("drama", "character", "TP")], by = c("drama", "character"), all.x = TRUE)
+f$eval <- merge(f$eval, incorrect[, c("drama", "character", "FP")], by = c("drama", "character"), all.x = TRUE)
+f$eval$TP <- replace_na(ifelse(f$eval$TP == TRUE, "TP", "TN"), "")
+f$eval$FP <- replace_na(ifelse(f$eval$FP == TRUE, "FP", "FN"), "")
+f$eval$evalType <- paste(f$eval$TP, f$eval$FP, sep = "")
+
+f$eval %>% filter(evalType != "FN") %>% ungroup() %>%
+  select(all_of(featuresDist), evalType) %>%
+  group_by(evalType) %>%
+  dplyr::summarise(tokens_mean = mean(tokens), tokens_min = min(tokens), tokens_max = max(tokens), tokens_sd = sd(tokens),
+            utterances_mean = mean(utterances), utterances_min = min(utterances), utterances_max = max(utterances), utterances_sd = sd(utterances),
+            religion_mean = mean(Religion), religion_min = min(Religion), religion_max = max(Religion), religion_sd = sd(Religion)) %>%
+  pivot_longer(cols = (-evalType), names_to = c("feature", ".value"), names_sep = "_")%>%
+  arrange(factor(evalType, levels = c("TP", "TN", "FP", "FN"))) %>%
+  arrange(factor(feature, levels = c("tokens", "utterances", "religion"))) %>%
+  as.data.frame() %>%
+  format(scientific = FALSE) %>%
+  kable()
+```
+
+## Feature Importance
+
+```{r vimp, fig.cap="Feature Importance", results="asis", fig.width=6,fig.height=10}
+set.seed(seed)
+model_rf <- ranger(type ~ .,data = f$f[,c(all_features, "type")],importance = "impurity")
+model_rf_vi <- as.data.frame(model_rf$variable.importance)
+model_rf_vi <- setDT(model_rf_vi, keep.rownames = TRUE)[]
+names(model_rf_vi) <- c("feature", "VI")
+featureImp <- model_rf_vi %>%
+  ggplot(aes(x=reorder(feature,VI), y=VI))+ 
+  geom_bar(stat="identity", position="dodge")+ coord_flip()+
+  ylab("Variable Importance")+
+  xlab("") +
+  scale_color_tableau()
+featureImp
+ggsave(filename = paste0(fig_dir,"feature-imp-",paste(classes, collapse="-"),".png"), plot = featureImp, dpi = 300)
+write.table(x = model_rf_vi, file = paste0(fig_dir,"feature-imp-",paste(classes, collapse="-"),".csv"), sep = ",", col.names = TRUE, row.names = FALSE)
+```
+
+
+# PCA
+
+```{r pca}
+# Separate variables and classes/metadata
+type_spread <- c("type")
+f$f$typenames <- "type"
+f_spread <- pivot_wider(f$f, names_from=typenames, values_from=type)
+f_spread <- cbind(f_spread[c(all_features, type_spread)], f$orig[c("corpus", "drama", "character")])
+v <- unique(f_spread[c(all_features)])
+c <- unique(f_spread[c("corpus", "drama", "character", type_spread)])
+c$character <- gsub("marianens_stimme", "mariane", c$character)
+# Remove highly correlated variables
+if (length(all_features)>1) {
+  v <- v[,apply(v,2,function(v) !all(v==0))]
+  v <- v[vapply(v, function(x) length(unique(x)) > 1, logical(1L))] # Remove features that have just one value
+  v.cor <- cor(v)
+  hc <- findCorrelation(v.cor, cutoff=0.7)
+  hc <- sort(hc)
+  if (length(hc)!=0) {
+    v.nocor <- v[,-c(hc)]
+  } else {
+    v.nocor <- v
+  }
+} else {
+  v.nocor <- v
+}
+# Perform PCA
+v.pca <- prcomp(v.nocor, center=TRUE, scale.=TRUE)
+# PC variance distribution
+plot(v.pca, type = "l")
+# Plot
+g_type <- ggbiplot(v.pca, obs.scale=1, var.scale=1,
+                   var.axes = FALSE,
+                   labels.size = 2,
+                   groups=f_spread$type, ellipse=TRUE,
+                   circle=TRUE) +
+  scale_color_discrete(name='') +
+  scale_shape_discrete(name='') +
+  geom_point(aes(colour=f_spread$type,shape=f_spread$type),size=2) +
+  theme(legend.direction='horizontal', 
+        legend.position='top',  
+        plot.margin=grid::unit(c(0,0,0,5), "mm")
+  )
+g_type
+ggsave(filename = paste0(fig_dir, "pca-", paste(classes, collapse="-"),".png"), plot = g_type, dpi = 300, width=7,height=7)
+```
+
+# PCA with False Positives
+
+```{r pca-fp}
+# Separate variables and classes/metadata
+type_spread <- c("type")
+f$f$typenames <- "type"
+f_spread <- pivot_wider(f$f, names_from=typenames, values_from=type)
+f_spread <- cbind(f_spread[c(all_features, type_spread)], f$orig[c("corpus", "drama", "character")])
+f_spread$type <- as.character(f_spread$type)
+f_spread[which(f_spread$drama %in% incorrect$drama & f_spread$character %in% incorrect$character & incorrect$FP == TRUE), "type"] <- "Schemer (FP)"
+f_spread$type <- as.factor(f_spread$type)
+v <- unique(f_spread[c(all_features)])
+c <- unique(f_spread[c("corpus", "drama", "character", type_spread)])
+# Remove highly correlated variables
+if (length(all_features)>1) {
+  v <- v[,apply(v,2,function(v) !all(v==0))]
+  v <- v[vapply(v, function(x) length(unique(x)) > 1, logical(1L))] # Remove features that have just one value
+  v.cor <- cor(v)
+  hc <- findCorrelation(v.cor, cutoff=0.7)
+  hc <- sort(hc)
+  if (length(hc)!=0) {
+    v.nocor <- v[,-c(hc)]
+  } else {
+    v.nocor <- v
+  }
+} else {
+  v.nocor <- v
+}
+# Perform PCA
+v.pca <- prcomp(v.nocor, center=TRUE, scale=TRUE)
+# PC variance distribution
+plot(v.pca, type = "l")
+# Plot
+g_type <- ggbiplot(v.pca, obs.scale=1, var.scale=1,
+                   choices=c(1,2),
+                   var.axes = FALSE,
+                   labels.size = 2,
+                   groups=f_spread$type, ellipse=TRUE,
+                   circle=TRUE) +
+  scale_color_discrete(name='') +
+  scale_shape_discrete(name='') +
+  geom_point(aes(colour=f_spread$type,shape=f_spread$type),size=2) +
+  theme(legend.direction='horizontal', 
+        legend.position='top',  
+        plot.margin=grid::unit(c(0,0,0,5), "mm")
+  )
+g_type
+ggsave(filename = paste0(fig_dir, "pca-fp-", paste(classes, collapse="-"),".png"), plot = g_type, dpi = 300, width=7,height=7)
+```
